@@ -1,54 +1,77 @@
-name: Train and Upload to Hugging Face
+name: Train and deploy to Hugging Face
 
 on:
   push:
-    branches: [main, master]
+    branches: [main]
+    paths:
+      - "train.py"
+      - "predict.py"
+      - "data/**"
+      - "requirements.txt"
   workflow_dispatch:
 
 jobs:
-  train-and-upload:
+  train-and-push:
     runs-on: ubuntu-latest
-
     steps:
-      - name: Checkout code
-        uses: actions/checkout@v4
+      - uses: actions/checkout@v4
+        with:
+          lfs: true
 
-      - name: Set up Python
-        uses: actions/setup-python@v5
+      - uses: actions/setup-python@v5
         with:
           python-version: "3.11"
-          cache: "pip"
+          cache: pip
 
       - name: Install dependencies
-        run: pip install -r requirements.txt
+        run: |
+          pip install torch --index-url https://download.pytorch.org/whl/cpu
+          pip install -r requirements.txt
 
       - name: Train model
-        run: python train.py
+        run: python train.py --data data/imdb_top_500.csv --out artifacts
 
-      - name: Upload to Hugging Face Hub
+      - name: Smoke test predict.py
+        run: python predict.py "this is a quick test"
+
+      - name: Push to Hugging Face Hub
         env:
           HF_TOKEN: ${{ secrets.HF_TOKEN }}
+          HF_REPO_ID: ${{ vars.HF_REPO_ID }}
         run: |
-          python - <<'EOF'
-          import os
+          python - << 'PY'
+          import os, shutil
           from huggingface_hub import HfApi
 
-          token = os.environ["HF_TOKEN"]
-          repo_id = "YOUR_HF_REPO"
-          api = HfApi()
+          repo_id = os.environ["HF_REPO_ID"]
+          api = HfApi(token=os.environ["HF_TOKEN"])
+          api.create_repo(repo_id=repo_id, repo_type="model", exist_ok=True)
 
-          # Create repo if it doesn't exist
-          api.create_repo(repo_id, token=token, exist_ok=True)
+          # Dossier de staging : artefacts + code
+          stage = "hf_upload"
+          shutil.rmtree(stage, ignore_errors=True)
+          shutil.copytree("artifacts", stage)
+          for f in ["train.py", "predict.py", "requirements.txt"]:
+              shutil.copy(f, stage)
 
-          # Upload all model artifacts
-          for filename in [FILES_TO_UPLOAD_TO_HF]:
-              api.upload_file(
-                  path_or_fileobj=filename,
-                  path_in_repo=filename,
-                  repo_id=repo_id,
-                  token=token,
-              )
-              print(f"Uploaded {filename}")
+          readme = (
+              "---\n"
+              "library_name: pytorch\n"
+              "tags:\n- text-classification\n- tf-idf\n"
+              "---\n"
+              f"# {repo_id}\n\n"
+              "Classifieur binaire de texte : TF-IDF + reseau dense (PyTorch).\n\n"
+              "    pip install -r requirements.txt torch\n"
+              "    python predict.py \"Votre texte ici\"\n"
+          )
+          with open(os.path.join(stage, "README.md"), "w") as f:
+              f.write(readme)
 
-          print(f"Model uploaded to https://huggingface.co/{repo_id}")
-          EOF
+          api.upload_folder(
+              folder_path=stage,
+              repo_id=repo_id,
+              repo_type="model",
+              commit_message="Automated upload from GitHub Actions",
+          )
+          print(f"Upload termine : https://huggingface.co/{repo_id}")
+          PY
